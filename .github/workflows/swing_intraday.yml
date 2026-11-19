@@ -1,0 +1,61 @@
+name: Intraday Swing Alerts
+
+on:
+  schedule:
+    # Four checks per hour, 9:47 AM–3:47 PM New York time.
+    # GitHub's timezone support adjusts automatically for daylight saving time.
+    - cron: '47 9 * * 1-5'
+      timezone: 'America/New_York'
+    - cron: '2,17,32,47 10-15 * * 1-5'
+      timezone: 'America/New_York'
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: 'Send a Telegram test only (no market scan)'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: intraday-swing-alerts
+  cancel-in-progress: false
+
+jobs:
+  intraday_swing:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out agent
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Restore previous intraday swing alerts
+        uses: actions/cache@v4
+        with:
+          path: swing_intraday_sent.db
+          key: swing-intraday-db-${{ github.run_id }}
+          restore-keys: |
+            swing-intraday-db-
+      - name: Install requirements
+        run: pip install -r requirements.txt
+      - name: Scan intraday swing setups and send Telegram alerts
+        env:
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DATA_FEED: iex
+          WATCHLIST: SPY,QQQ,IWM,NVDA,TSLA,AMD,AMZN,PLTR,HOOD,AAPL,MSFT,META
+        shell: bash
+        run: |
+          if [[ '${{ inputs.test_alert }}' == 'true' ]]; then
+            python swing_intraday.py --test-alert
+          else
+            python swing_intraday.py --once
+          fi
