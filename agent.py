@@ -290,9 +290,30 @@ def run_scan(http: requests.Session, cfg: Settings, db: sqlite3.Connection,
         LOG.info("Outside active intraday scan window: %s", now.astimezone(ET))
         return 0
     count = 0
-    for sym in active_symbols(http, cfg):
+    successes = 0
+    evaluable = 0
+    failures = 0
+    symbols = active_symbols(http, cfg)
+    for sym in symbols:
         try:
             bars = fetch_bars(http, cfg, sym, now)
+            successes += 1
+            if bars.empty:
+                LOG.warning("%s: API responded, but no completed regular-session 5-minute bars were returned", sym)
+                continue
+            last_bar = bars.index[-1].to_pydatetime()
+            minutes_since_close = (now - (last_bar + timedelta(minutes=5))).total_seconds() / 60
+            last_three_contiguous = len(bars) >= 3 and (
+                bars.index[-1] - bars.index[-2] == pd.Timedelta(minutes=5) and
+                bars.index[-2] - bars.index[-3] == pd.Timedelta(minutes=5))
+            same_session = last_bar.astimezone(ET).date() == now.astimezone(ET).date()
+            usable = (len(bars) >= 35 and 0 <= minutes_since_close <= 10 and
+                      last_three_contiguous and same_session)
+            LOG.info("%s: %d completed bars; latest %s ET; %.1f min since close; %s",
+                     sym, len(bars), last_bar.astimezone(ET).strftime("%I:%M %p"),
+                     minutes_since_close, "data eligible" if usable else "data stale/sparse/insufficient")
+            if usable:
+                evaluable += 1
             sig = assess(sym, bars, now, cfg)
             if sig and not is_duplicate(db, sig, cfg):
                 msg = format_alert(sig)
@@ -301,9 +322,17 @@ def run_scan(http: requests.Session, cfg: Settings, db: sqlite3.Connection,
                     count += 1
                     LOG.info("Sent %s %s setup", sym, sig.side)
         except requests.HTTPError as exc:
+            failures += 1
             LOG.warning("%s request failed: HTTP %s", sym, exc.response.status_code if exc.response is not None else "?")
         except Exception:
+            failures += 1
             LOG.exception("%s scan failed", sym)
+    LOG.info("DATA HEALTH: %d/%d symbols fetched, %d had fresh continuous bars, %d errors; %d new alert(s)",
+             successes, len(symbols), evaluable, failures, count)
+    if successes == 0:
+        raise RuntimeError("No market data could be fetched. Check Alpaca credentials, feed and API errors above.")
+    if evaluable == 0:
+        raise RuntimeError("No symbols had enough fresh continuous bars to evaluate. Check IEX data coverage / timestamps above.")
     LOG.info("Scan complete: %d new alert(s)", count)
     return count
 
