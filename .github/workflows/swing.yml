@@ -1,8 +1,9 @@
+
 name: Swing Trade Alerts
 
 on:
   schedule:
-    # Runs at 23:17 UTC, after regular NYSE closes in either US timezone season.
+    # Runs after regular NYSE market close
     - cron: '17 23 * * 1-5'
   workflow_dispatch:
     inputs:
@@ -26,11 +27,13 @@ jobs:
     steps:
       - name: Check out agent
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
+
       - name: Restore previous swing alerts to prevent duplicates
         uses: actions/cache@v4
         with:
@@ -38,8 +41,10 @@ jobs:
           key: swing-db-${{ github.run_id }}
           restore-keys: |
             swing-db-
+
       - name: Install requirements
         run: pip install -r requirements.txt
+
       - name: Check swing setups and send Telegram alerts
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
@@ -47,7 +52,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DATA_FEED: iex
-          WATCHLIST: WATCHLIST: 'SPY,QQQ,IWM,DIA,NVDA,TSLA,AMD,AMZN,PLTR,HOOD,AAPL,MSFT,META,GOOGL,AVGO,MU,SMCI,CRWD,COIN,MSTR,NFLX,SOFI,SHOP,UBER'
+          WATCHLIST: 'SPY,QQQ,IWM,DIA,NVDA,TSLA,AMD,AMZN,PLTR,HOOD,AAPL,MSFT,META,GOOGL,AVGO,MU,SMCI,CRWD,COIN,MSTR,NFLX,SOFI,SHOP,UBER'
         shell: bash
         run: |
           if [[ '${{ inputs.test_alert }}' == 'true' ]]; then
