@@ -48,7 +48,7 @@ class Settings:
     def read(cls) -> "Settings":
         load_dotenv()
         watch = tuple(dict.fromkeys(s.strip().upper() for s in
-                                        os.getenv("WATCHLIST", "SPY,QQQ,IWM,NVDA,TSLA,AMD,AMZN,PLTR,HOOD,AAPL,MSFT,META")
+                                        os.getenv("WATCHLIST", "SPY,QQQ,IWM,DIA,NVDA,TSLA,AMD,AMZN,PLTR,HOOD,AAPL,MSFT,META,GOOGL,AVGO,MU,SMCI,CRWD,COIN,MSTR,NFLX,SOFI,SHOP,UBER")
                                         .split(",") if SYMBOL_RE.match(s.strip().upper())))
         return cls(
             key=os.getenv("ALPACA_API_KEY", "").strip(),
@@ -164,6 +164,9 @@ class Signal:
     stop: float
     target: float
     feed: str
+    level: str = "CONFIRMED"
+    matched: tuple[str, ...] = ()
+    missing: tuple[str, ...] = ()
 
 
 def assess(symbol: str, df: pd.DataFrame, now: datetime, cfg: Settings) -> Optional[Signal]:
@@ -206,6 +209,68 @@ def assess(symbol: str, df: pd.DataFrame, now: datetime, cfg: Settings) -> Optio
                   float(last["atr"]), stop, target, cfg.feed)
 
 
+def assess_levels(symbol: str, bars: pd.DataFrame, now: datetime,
+                  cfg: Settings) -> tuple[list[Signal], str]:
+    """Evaluate four interpretable checks for each direction on one completed 5m bar.
+
+    WATCH = exactly 3 of 4; CONFIRMED = 4 of 4. This is rule-based
+    confirmation, NOT evidence a trade will be profitable. Signal states
+    are eligible once per NYSE session (deduped in the persisted database).
+    """
+    if len(bars) < 35:
+        return [], "insufficient completed candles"
+    if (bars.index[-1] - bars.index[-2] != pd.Timedelta(minutes=5) or
+        bars.index[-2] - bars.index[-3] != pd.Timedelta(minutes=5)):
+        return [], "latest 3 candles are not consecutive"
+    t = bars.index[-1].to_pydatetime()
+    age = now - (t + timedelta(minutes=5))
+    if not (timedelta(0) <= age <= timedelta(minutes=10)):
+        return [], f"stale/latest bar age {age.total_seconds() / 60:.1f} minutes"
+    if t.astimezone(ET).date() != now.astimezone(ET).date():
+        return [], "latest candle belongs to a prior NYSE trading date"
+    x = with_indicators(bars)
+    last = x.iloc[-1]
+    required = ("ema9", "ema21", "vwap", "rsi", "rvol", "atr")
+    if any(pd.isna(last[k]) for k in required):
+        return [], "indicator warmup/validity incomplete"
+    price = float(last["close"])
+    atr = float(last["atr"])
+    if price <= 0 or not pd.notna(atr) or atr <= 0:
+        return [], "nonpositive price/ATR"
+
+    rsi = float(last["rsi"])
+    rvol = float(last["rvol"])
+    sides = (
+        ("BUY", {"EMA": last["ema9"] > last["ema21"],
+                 "VWAP": price > last["vwap"], "RSI": 55 <= rsi <= 80,
+                 "RVOL": rvol >= cfg.min_rvol}),
+        ("SELL/BEARISH", {"EMA": last["ema9"] < last["ema21"],
+                          "VWAP": price < last["vwap"], "RSI": 20 <= rsi <= 45,
+                          "RVOL": rvol >= cfg.min_rvol}),
+    )
+    diagnostics = []
+    out: list[Signal] = []
+    for side, tests in sides:
+        passed = tuple(k for k, ok in tests.items() if bool(ok))
+        failed = tuple(k for k, ok in tests.items() if not bool(ok))
+        diagnostics.append(f"{side} {len(passed)}/4; missing: {', '.join(failed) if failed else 'none'}")
+        if len(passed) < 3:
+            continue
+        # Sending only the highest tier at a given scan avoids doubled notices.
+        level = "CONFIRMED" if len(passed) == 4 else "WATCH"
+        dist = max(1.5 * atr, price * 0.001)
+        stop = price - dist if side == "BUY" else price + dist
+        target = price + 2 * dist if side == "BUY" else max(0.0, price - 2 * dist)
+        if target <= 0:
+            continue
+        out.append(Signal(
+            symbol, side, t, price, float(last["ema9"]), float(last["ema21"]),
+            float(last["vwap"]), rsi, rvol, atr, stop, target, cfg.feed,
+            level=level, matched=passed, missing=failed,
+        ))
+    return out, " | ".join(diagnostics)
+
+
 def create_db(cfg: Settings) -> sqlite3.Connection:
     db = sqlite3.connect(cfg.db_path)
     db.execute("""CREATE TABLE IF NOT EXISTS alerts (
@@ -215,34 +280,47 @@ def create_db(cfg: Settings) -> sqlite3.Connection:
     return db
 
 
+def _storage_side(sig: Signal) -> str:
+    return f"{sig.level}:{sig.side}"
+
+
 def is_duplicate(db: sqlite3.Connection, sig: Signal, cfg: Settings) -> bool:
-    last = db.execute("SELECT sent_at FROM alerts WHERE symbol=? AND side=? ORDER BY sent_at DESC LIMIT 1",
-                      (sig.symbol, sig.side)).fetchone()
-    if not last:
-        return False
-    ts = datetime.fromisoformat(last[0])
-    return (datetime.now(UTC) - ts) < timedelta(minutes=cfg.cooldown_minutes)
+    """Maximum one alert per symbol, direction, level, exchange session.
+
+    Reuses the historical `alerts` DB schema so old cache entries remain valid.
+    """
+    rows = db.execute("SELECT bar_time FROM alerts WHERE symbol=? AND side=? ORDER BY sent_at DESC LIMIT 10",
+                      (sig.symbol, _storage_side(sig))).fetchall()
+    day = sig.bar_time.astimezone(ET).date()
+    return any(datetime.fromisoformat(row[0]).astimezone(ET).date() == day for row in rows)
 
 
 def mark_sent(db: sqlite3.Connection, sig: Signal) -> None:
     db.execute("INSERT OR IGNORE INTO alerts(symbol, side, bar_time, sent_at) VALUES (?, ?, ?, ?)",
-               (sig.symbol, sig.side, sig.bar_time.isoformat(), datetime.now(UTC).isoformat()))
+               (sig.symbol, _storage_side(sig), sig.bar_time.isoformat(), datetime.now(UTC).isoformat()))
     db.commit()
 
 
 def format_alert(sig: Signal) -> str:
-    et = sig.bar_time.astimezone(ET)
-    tag = "🟢" if sig.side == "BUY" else "🔴"
-    return (f"{tag} {sig.side} SETUP | {sig.symbol}\n"
-            f"Closed 5-min bar: {et:%Y-%m-%d %I:%M %p} ET (start time)\n"
-            f"Reference price: ${sig.price:,.2f}\n"
+    closed = (sig.bar_time + timedelta(minutes=5)).astimezone(ET)
+    icon = "🟢" if sig.side == "BUY" else "🔴"
+    tier_note = ("Early watch: 3/4 checks align; not a confirmed entry."
+                 if sig.level == "WATCH" else
+                 "Rule-confirmed: 4/4 technical checks align; not a guaranteed trade.")
+    return (f"{icon} {sig.level} {sig.side} SETUP | {sig.symbol}\n"
+            f"{tier_note}\n"
+            f"Completed 5-min candle: {closed:%Y-%m-%d %I:%M %p} ET\n"
+            f"IEX reference price: ${sig.price:,.2f} (not executable quote)\n"
+            f"Checks met: {', '.join(sig.matched) if sig.matched else 'all four'}\n"
+            f"Checks missing: {', '.join(sig.missing) if sig.missing else 'none'}\n"
             f"EMA9 / EMA21: {sig.ema9:.2f} / {sig.ema21:.2f}\n"
             f"Session VWAP: ${sig.vwap:.2f} | RSI14: {sig.rsi:.1f}\n"
             f"Relative volume: {sig.rvol:.2f}x | ATR14: ${sig.atr:.2f}\n"
-            f"Indicative invalidation/stop: ${sig.stop:.2f}\n"
+            f"Illustrative stop reference: ${sig.stop:.2f}\n"
             f"Illustrative 2R target: ${sig.target:.2f}\n"
-            f"Feed: Alpaca {sig.feed.upper()} | {sig.symbol} chart: https://www.tradingview.com/symbols/{sig.symbol}/\n"
-            "RESEARCH SIGNAL ONLY. Prices can change; not a trade order. Confirm on your broker's live chart.")
+            f"Alpaca {sig.feed.upper()} single-exchange feed; volume may not represent all US trading.\n"
+            f"Chart: https://www.tradingview.com/symbols/{sig.symbol}/\n"
+            "Research watch only. Verify news, liquidity, current price and risks. No orders placed.")
 
 
 def send_telegram(http: requests.Session, cfg: Settings, message: str) -> bool:
@@ -314,13 +392,17 @@ def run_scan(http: requests.Session, cfg: Settings, db: sqlite3.Connection,
                      minutes_since_close, "data eligible" if usable else "data stale/sparse/insufficient")
             if usable:
                 evaluable += 1
-            sig = assess(sym, bars, now, cfg)
-            if sig and not is_duplicate(db, sig, cfg):
+            signals, diagnostic = assess_levels(sym, bars, now, cfg)
+            LOG.info("%s criteria: %s", sym, diagnostic)
+            for sig in signals:
+                if is_duplicate(db, sig, cfg):
+                    LOG.info("%s %s %s suppressed: already alerted this session", sym, sig.level, sig.side)
+                    continue
                 msg = format_alert(sig)
                 if send_telegram(http, cfg, msg):
                     mark_sent(db, sig)
                     count += 1
-                    LOG.info("Sent %s %s setup", sym, sig.side)
+                    LOG.info("Sent %s %s %s", sym, sig.level, sig.side)
         except requests.HTTPError as exc:
             failures += 1
             LOG.warning("%s request failed: HTTP %s", sym, exc.response.status_code if exc.response is not None else "?")

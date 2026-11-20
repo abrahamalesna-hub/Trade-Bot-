@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+from dataclasses import replace
 import os
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -141,10 +142,100 @@ def assess_intraday_swing(sym: str, historical: pd.DataFrame, intraday: pd.DataF
     )
 
 
+def assess_swing_levels(sym: str, historical: pd.DataFrame, intraday: pd.DataFrame,
+                        session, now: datetime, feed: str = "iex") -> tuple[SwingSignal | None, str]:
+    """Prefer the original strict setup, or issue a 3/4 early proximity watch.
+
+    Uses only completed 5-minute intraday bars and the *prior* session's
+    daily trend. WATCH does not mean a breakout is confirmed or a trade is safe.
+    """
+    confirmed = assess_intraday_swing(sym, historical, intraday, session, now, feed)
+    if confirmed is not None:
+        return replace(confirmed, direction=f"{confirmed.direction} [CONFIRMED]"), (
+            "CONFIRMED: strict prior-day trend plus two-bar breakout/reclaim")
+
+    if len(historical) < 215 or len(intraday) < 2:
+        return None, "too few completed daily/intraday bars"
+    if historical.iloc[-1]["session"] >= session:
+        return None, "no valid prior-day daily candle"
+    priors = indicators(historical)
+    last = priors.iloc[-1]
+    required = ("ema20", "ema50", "ema200", "rsi", "atr")
+    if any(pd.isna(last[k]) or not math.isfinite(float(last[k])) for k in required):
+        return None, "incomplete daily indicators"
+    p1, p2 = intraday.iloc[-2], intraday.iloc[-1]
+    t = intraday.index[-1].to_pydatetime()
+    if not (intraday.index[-1] - intraday.index[-2] == pd.Timedelta(minutes=5) and
+            timedelta(0) <= now.astimezone(UTC) - (t + BAR_INTERVAL) <= FRESHNESS_LIMIT and
+            t.astimezone(ET).date() == session and
+            min(float(p1["volume"]), float(p2["volume"])) > 0):
+        return None, "missing, sparse or stale 5-minute bars"
+
+    price = float(p2["close"])
+    prev5 = float(p1["close"])
+    atr = float(last["atr"])
+    rsi = float(last["rsi"])
+    e20, e50, e200 = (float(last[k]) for k in ("ema20", "ema50", "ema200"))
+    if price <= 1 or atr <= 0 or atr / price > .15:
+        return None, "price/ATR risk filter failed"
+    high20 = float(historical["high"].tail(20).max())
+    low20 = float(historical["low"].tail(20).min())
+    if min(high20, low20, e20) <= 0:
+        return None, "invalid breakout reference"
+
+    tests_long = {
+        "daily trend": (e20 > e50 and price > e50 and e50 >= .97 * e200),
+        "near breakout/reclaim": (0.985 <= price / high20 <= 1.015 or
+                                  0.99 <= price / e20 <= 1.02),
+        "intraday momentum": price >= prev5,
+        "daily RSI": 45 <= rsi <= 78,
+    }
+    tests_short = {
+        "daily trend": (e20 < e50 and price < e50 and e50 <= 1.03 * e200),
+        "near breakdown/rejection": (0.985 <= price / low20 <= 1.015 or
+                                     0.98 <= price / e20 <= 1.01),
+        "intraday momentum": price <= prev5,
+        "daily RSI": 22 <= rsi <= 55,
+    }
+    diagnostics = []
+    for side, tests in (("BUY / BULLISH", tests_long), ("SELL / BEARISH", tests_short)):
+        score = sum(bool(z) for z in tests.values())
+        missing = [k for k, v in tests.items() if not bool(v)]
+        diagnostics.append(f"{side}: {score}/4, missing {', '.join(missing) if missing else 'none'}")
+        # Trend + near technical level are required to avoid generic volatility alerts.
+        if score < 3 or not list(tests.values())[0] or not list(tests.values())[1]:
+            continue
+        dist = 1.5 * atr
+        if dist <= 0 or dist / price > .10:
+            continue
+        if side.startswith("BUY"):
+            stop, t1, t2 = price - dist, price + 2 * dist, price + 3 * dist
+        else:
+            stop, t1, t2 = price + dist, price - 2 * dist, price - 3 * dist
+            if t2 <= 0:
+                continue
+        sig = SwingSignal(
+            symbol=sym, direction=f"{side} [WATCH]",
+            pattern="Approaching a key 20-day/EMA20 level; 3+ early checks align",
+            session=session, price=price, rsi=rsi, rvol=float("nan"), atr=atr,
+            ema20=e20, ema50=e50, ema200=e200, stop=stop,
+            target1=t1, target2=t2,
+            first_checkpoint=trading_day_after(session, 10),
+            final_checkpoint=trading_day_after(session, 30), feed=feed,
+        )
+        return sig, " | ".join(diagnostics)
+    return None, " | ".join(diagnostics)
+
+
 def alert_message(s: SwingSignal, last_bar_start: datetime) -> str:
     icon = "🟢" if s.direction.startswith("BUY") else "🔴"
     observed = (last_bar_start + BAR_INTERVAL).astimezone(ET).strftime("%Y-%m-%d %I:%M %p ET")
-    return (f"{icon} INTRADAY SWING WATCH — {s.symbol} {s.direction}\n"
+    level = "CONFIRMED" if "[CONFIRMED]" in s.direction else "WATCH"
+    label = ("Original strict two-bar technical entry conditions met."
+             if level == "CONFIRMED" else
+             "Early watch: proximity and trend conditions; breakout is NOT confirmed.")
+    return (f"{icon} {level} INTRADAY SWING — {s.symbol} {s.direction}\n"
+            f"{label}\n"
             f"Setup: {s.pattern}\n"
             f"Last completed 5-min bar: {observed}\n"
             f"Indicative IEX reference price: ${s.price:.2f} (NOT executable quote)\n"
@@ -194,12 +285,16 @@ def scan(http: requests.Session, cfg: Settings, db, now: datetime | None = None)
                 errors += 1
                 continue
             good += 1
-            signal = assess_intraday_swing(sym, daily, bars, today, now, cfg.feed)
-            if signal is not None and not is_sent(db, signal):
-                send_telegram(http, cfg, alert_message(signal, bars.index[-1].to_pydatetime()))
-                record_sent(db, signal, now)
-                alerts += 1
-                LOG.info("Sent %s %s intraday swing watch", sym, signal.direction)
+            signal, diagnostic = assess_swing_levels(sym, daily, bars, today, now, cfg.feed)
+            LOG.info("%s swing criteria: %s", sym, diagnostic)
+            if signal is not None:
+                if is_sent(db, signal):
+                    LOG.info("%s %s already alerted this NYSE trading day", sym, signal.direction)
+                else:
+                    send_telegram(http, cfg, alert_message(signal, bars.index[-1].to_pydatetime()))
+                    record_sent(db, signal, now)
+                    alerts += 1
+                    LOG.info("Sent %s %s intraday swing watch", sym, signal.direction)
         except requests.HTTPError as exc:
             errors += 1
             LOG.error("%s Alpaca HTTP %s", sym,
