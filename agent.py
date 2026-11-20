@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Day-trading signal WATCH bot. Sends alerts; NEVER places orders."""
+"""Day-trading signal WATCH bot with virtual exit tracking. NEVER places orders."""
 from __future__ import annotations
 
 import argparse
@@ -276,6 +276,10 @@ def create_db(cfg: Settings) -> sqlite3.Connection:
     db.execute("""CREATE TABLE IF NOT EXISTS alerts (
        symbol TEXT NOT NULL, side TEXT NOT NULL, bar_time TEXT NOT NULL,
        sent_at TEXT NOT NULL, PRIMARY KEY(symbol, side, bar_time))""")
+    db.execute("""CREATE TABLE IF NOT EXISTS tracked_setups (
+       symbol TEXT PRIMARY KEY, side TEXT NOT NULL, entry_bar TEXT NOT NULL,
+       entry_reference REAL NOT NULL, stop REAL NOT NULL, target REAL NOT NULL,
+       last_checked_bar TEXT NOT NULL, feed TEXT NOT NULL)""")
     db.commit()
     return db
 
@@ -356,6 +360,177 @@ def active_symbols(http: requests.Session, cfg: Settings) -> list[str]:
     return symbols[:35]
 
 
+
+@dataclass(frozen=True)
+class TrackedSetup:
+    """A hypothetical setup from a CONFIRMED alert, NOT an executed position."""
+    symbol: str
+    side: str
+    entry_bar: datetime
+    entry_reference: float
+    stop: float
+    target: float
+    last_checked_bar: datetime
+    feed: str
+
+
+@dataclass(frozen=True)
+class ExitNotice:
+    symbol: str
+    side: str
+    time: datetime
+    reference_price: Optional[float]
+    reason: str
+    entry_reference: float
+    stop: float
+    target: float
+    feed: str
+
+
+def load_setup(db: sqlite3.Connection, symbol: str) -> Optional[TrackedSetup]:
+    row = db.execute("""SELECT symbol,side,entry_bar,entry_reference,stop,target,
+                              last_checked_bar,feed FROM tracked_setups WHERE symbol=?""",
+                     (symbol,)).fetchone()
+    if not row:
+        return None
+    return TrackedSetup(row[0], row[1], datetime.fromisoformat(row[2]),
+                        float(row[3]), float(row[4]), float(row[5]),
+                        datetime.fromisoformat(row[6]), row[7])
+
+
+def register_confirmed_setup(db: sqlite3.Connection, sig: Signal) -> bool:
+    """Track ONLY a confirmed alert and only if the ticker has no open virtual setup."""
+    if sig.level != "CONFIRMED":
+        return False
+    existing = load_setup(db, sig.symbol)
+    if existing is not None:
+        LOG.info("%s: a virtual setup is already being tracked; no new tracking opened", sig.symbol)
+        return False
+    db.execute("""INSERT INTO tracked_setups
+        (symbol,side,entry_bar,entry_reference,stop,target,last_checked_bar,feed)
+        VALUES (?,?,?,?,?,?,?,?)""", (sig.symbol, sig.side, sig.bar_time.isoformat(),
+                                      sig.price, sig.stop, sig.target,
+                                      sig.bar_time.isoformat(), sig.feed))
+    db.commit()
+    LOG.info("%s: tracking a hypothetical %s setup from reference %.2f (stop %.2f target %.2f)",
+             sig.symbol, sig.side, sig.price, sig.stop, sig.target)
+    return True
+
+
+def delete_setup(db: sqlite3.Connection, symbol: str) -> None:
+    db.execute("DELETE FROM tracked_setups WHERE symbol=?", (symbol,))
+    db.commit()
+
+
+def advance_setup(db: sqlite3.Connection, symbol: str, bar_time: datetime) -> None:
+    db.execute("UPDATE tracked_setups SET last_checked_bar=? WHERE symbol=?",
+               (bar_time.isoformat(), symbol))
+    db.commit()
+
+
+def _notice(tracked: TrackedSetup, start: datetime, reference: Optional[float],
+            reason: str) -> ExitNotice:
+    return ExitNotice(tracked.symbol, tracked.side, start, reference, reason,
+                      tracked.entry_reference, tracked.stop, tracked.target, tracked.feed)
+
+
+def evaluate_exit(tracked: TrackedSetup, bars: pd.DataFrame,
+                  now: datetime, session_close: datetime) -> tuple[Optional[ExitNotice], Optional[datetime]]:
+    """Evaluate only NEW, CLOSED 5-minute bars after a hypothetical entry.
+
+    Stop/target collisions in the same bar resolve conservatively as STOP FIRST.
+    Exit is a *signal*, never evidence that a broker order executed at that price.
+    """
+    current_session = now.astimezone(ET).date()
+    if tracked.entry_bar.astimezone(ET).date() != current_session:
+        return _notice(tracked, now, None, "TRACKING EXPIRED — previous session, fill/exit unknown"), None
+    if bars.empty:
+        return None, None
+    recent = bars.loc[bars.index > tracked.last_checked_bar]
+    # Never evaluate the signal candle or prices from before the entry reference.
+    recent = recent.loc[recent.index > tracked.entry_bar]
+    if recent.empty:
+        # If the previous run already checked the last candle, still send the
+        # once-per-day time-exit watch when the close approaches. This uses a
+        # recent completed bar, not a fabricated executable close price.
+        last = bars.index[-1].to_pydatetime()
+        fresh = timedelta(0) <= now - (last + timedelta(minutes=5)) <= timedelta(minutes=10)
+        if (now >= session_close - timedelta(minutes=12) and fresh and
+                last > tracked.entry_bar and last.astimezone(ET).date() == current_session):
+            return _notice(tracked, last, float(bars.iloc[-1]["close"]),
+                           "END-OF-DAY time exit reference"), last
+        return None, None
+    x = with_indicators(bars)
+    last_checked = None
+    for ts, bar in x.loc[recent.index].iterrows():
+        t = ts.to_pydatetime()
+        if t.astimezone(ET).date() != current_session:
+            continue
+        last_checked = t
+        is_long = tracked.side == "BUY"
+        stop_hit = (float(bar["low"]) <= tracked.stop if is_long else
+                    float(bar["high"]) >= tracked.stop)
+        target_hit = (float(bar["high"]) >= tracked.target if is_long else
+                      float(bar["low"]) <= tracked.target)
+        if stop_hit:
+            return _notice(tracked, t, tracked.stop, "STOP reference touched"), last_checked
+        if target_hit:
+            return _notice(tracked, t, tracked.target, "2R TARGET reference touched"), last_checked
+        # A close-based reversal requires trend weakness AND loss of VWAP,
+        # rather than a single noisy 5-minute dip.
+        if all(pd.notna(bar[f]) for f in ("ema9", "ema21", "vwap", "rsi")):
+            close = float(bar["close"])
+            if is_long:
+                reversal = ((float(bar["ema9"]) < float(bar["ema21"])) or (
+                    close < float(bar["ema9"]) and close < float(bar["vwap"]) and float(bar["rsi"]) < 50))
+            else:
+                reversal = ((float(bar["ema9"]) > float(bar["ema21"])) or (
+                    close > float(bar["ema9"]) and close > float(bar["vwap"]) and float(bar["rsi"]) > 50))
+            if reversal:
+                return _notice(tracked, t, close, "MOMENTUM / TREND invalidation"), last_checked
+    # All day-trade virtual setups end before the close, not overnight.
+    if last_checked is not None and now >= session_close - timedelta(minutes=12):
+        return _notice(tracked, last_checked, float(x.loc[last_checked, "close"]),
+                       "END-OF-DAY time exit reference"), last_checked
+    return None, last_checked
+
+
+def format_exit_notice(n: ExitNotice) -> str:
+    clock = n.time.astimezone(ET)
+    when = (n.time + timedelta(minutes=5)).astimezone(ET) if n.reference_price is not None else clock
+    side_label = "BULLISH/LONG" if n.side == "BUY" else "BEARISH/SHORT"
+    value = (f"Reference exit: ${n.reference_price:,.2f} (NOT a fill quote)" if
+             n.reference_price is not None else "Exit price unknown — check your brokerage")
+    return (f"🚪 VIRTUAL SETUP EXIT WATCH | {n.symbol} | {side_label}\n"
+            f"Reason: {n.reason}\n"
+            f"5-min reference time: {when:%Y-%m-%d %I:%M %p} ET\n"
+            f"Original alert reference: ${n.entry_reference:,.2f}\n"
+            f"{value}\n"
+            f"Stop / target references: ${n.stop:,.2f} / ${n.target:,.2f}\n"
+            f"Source: Alpaca {n.feed.upper()} (single-exchange if IEX).\n"
+            "This tracks a hypothetical CONFIRMED signal, not your actual brokerage position. "
+            "Price thresholds may be crossed without an executable fill. "
+            "No orders are placed; verify actual holdings and current quotes.")
+
+
+def check_and_alert_exit(http: requests.Session, cfg: Settings,
+                         db: sqlite3.Connection, sym: str, bars: pd.DataFrame,
+                         now: datetime, close: datetime) -> bool:
+    tracked = load_setup(db, sym)
+    if tracked is None:
+        return False
+    notice, last = evaluate_exit(tracked, bars, now, close)
+    if notice:
+        # A failed Telegram send must NOT clear the tracked setup.
+        if send_telegram(http, cfg, format_exit_notice(notice)):
+            delete_setup(db, sym)
+            LOG.info("%s virtual setup exit alert: %s", sym, notice.reason)
+            return True
+    elif last is not None:
+        advance_setup(db, sym, last)
+    return False
+
+
 def run_scan(http: requests.Session, cfg: Settings, db: sqlite3.Connection,
              now: Optional[datetime] = None) -> int:
     now = now or datetime.now(UTC)
@@ -364,14 +539,18 @@ def run_scan(http: requests.Session, cfg: Settings, db: sqlite3.Connection,
         LOG.info("NYSE closed: holiday or weekend")
         return 0
     op, cl = window
-    if not (op + timedelta(minutes=15) <= now <= cl - timedelta(minutes=10)):
+    if not (op + timedelta(minutes=15) <= now <= cl - timedelta(minutes=5)):
         LOG.info("Outside active intraday scan window: %s", now.astimezone(ET))
         return 0
     count = 0
+    exit_alerts = 0
     successes = 0
     evaluable = 0
     failures = 0
     symbols = active_symbols(http, cfg)
+    # Cache persists alerts.db across GitHub runs (best effort, not brokerage-grade).
+    virtual_count = db.execute("SELECT COUNT(*) FROM tracked_setups").fetchone()[0]
+    LOG.info("Tracked hypothetical setups loaded from previous runs: %d", virtual_count)
     for sym in symbols:
         try:
             bars = fetch_bars(http, cfg, sym, now)
@@ -392,15 +571,23 @@ def run_scan(http: requests.Session, cfg: Settings, db: sqlite3.Connection,
                      minutes_since_close, "data eligible" if usable else "data stale/sparse/insufficient")
             if usable:
                 evaluable += 1
+                if check_and_alert_exit(http, cfg, db, sym, bars, now, cl):
+                    exit_alerts += 1
             signals, diagnostic = assess_levels(sym, bars, now, cfg)
             LOG.info("%s criteria: %s", sym, diagnostic)
             for sig in signals:
+                # Don't open new virtual day trades in the last 30 minutes.
+                if sig.level == "CONFIRMED" and now >= cl - timedelta(minutes=30):
+                    LOG.info("%s: skipped near-close CONFIRMED entry alert", sym)
+                    continue
                 if is_duplicate(db, sig, cfg):
                     LOG.info("%s %s %s suppressed: already alerted this session", sym, sig.level, sig.side)
                     continue
                 msg = format_alert(sig)
                 if send_telegram(http, cfg, msg):
                     mark_sent(db, sig)
+                    if sig.level == "CONFIRMED":
+                        register_confirmed_setup(db, sig)
                     count += 1
                     LOG.info("Sent %s %s %s", sym, sig.level, sig.side)
         except requests.HTTPError as exc:
@@ -415,7 +602,7 @@ def run_scan(http: requests.Session, cfg: Settings, db: sqlite3.Connection,
         raise RuntimeError("No market data could be fetched. Check Alpaca credentials, feed and API errors above.")
     if evaluable == 0:
         raise RuntimeError("No symbols had enough fresh continuous bars to evaluate. Check IEX data coverage / timestamps above.")
-    LOG.info("Scan complete: %d new alert(s)", count)
+    LOG.info("Scan complete: %d entry/watch alert(s), %d virtual exit alert(s)", count, exit_alerts)
     return count
 
 
