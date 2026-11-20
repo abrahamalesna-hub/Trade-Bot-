@@ -1,14 +1,13 @@
+
 name: Free Phone Market Alerts
 
 on:
   schedule:
-    # UTC. Covers US regular trading hours in both daylight and standard time.
-    # Python checks the NYSE session calendar, including holidays/early closes.
     - cron: '3,8,13,18,23,28,33,38,43,48,53,58 13-21 * * 1-5'
   workflow_dispatch:
     inputs:
       test_alert:
-        description: 'Send a test message to Telegram (without using market data)'
+        description: 'Send a test message to Telegram'
         type: boolean
         required: false
         default: true
@@ -27,21 +26,25 @@ jobs:
     steps:
       - name: Check out scanner
         uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: pip
-      - name: Restore previous alert history for deduplication
+
+      - name: Restore previous alert history
         uses: actions/cache@v4
         with:
           path: alerts.db
           key: alert-db-${{ github.run_id }}
           restore-keys: |
             alert-db-
+
       - name: Install dependencies
         run: pip install -r requirements.txt
-      -h name: Check setups and send free Telegram alerts
+
+      - name: Check setups and send free Telegram alerts
         env:
           ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
           ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
