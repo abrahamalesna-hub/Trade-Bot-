@@ -23,6 +23,7 @@ from agent import ET, UTC, NYSE, Settings, api_get, make_http, send_telegram
 from swing_agent import (SwingSignal, fetch_daily_bars, indicators,
                          most_recent_completed_session, new_db, is_sent,
                          record_sent, trading_day_after)
+from swing_exit_tracking import init_exit_tables, open_virtual, review_intraday, count_open
 
 LOG = logging.getLogger("swing-intraday")
 BAR_INTERVAL = timedelta(minutes=5)
@@ -261,7 +262,9 @@ def scan(http: requests.Session, cfg: Settings, db, now: datetime | None = None)
     if completed is None or completed >= today:
         LOG.info("No prior completed NYSE session available — skipped")
         return 0
-    good, errors, alerts = 0, 0, 0
+    init_exit_tables(db)
+    good, errors, alerts, exits = 0, 0, 0, 0
+    LOG.info("Intraday virtual swing setups loaded: %d", count_open(db, 'intraday'))
     for sym in cfg.watchlist:
         try:
             daily = fetch_daily_bars(http, cfg, sym, now)
@@ -285,6 +288,10 @@ def scan(http: requests.Session, cfg: Settings, db, now: datetime | None = None)
                 errors += 1
                 continue
             good += 1
+            prior_indicators = indicators(daily)
+            exits += review_intraday(
+                db, sym, bars, prior_indicators, now,
+                lambda message: send_telegram(http, cfg, message))
             signal, diagnostic = assess_swing_levels(sym, daily, bars, today, now, cfg.feed)
             LOG.info("%s swing criteria: %s", sym, diagnostic)
             if signal is not None:
@@ -293,6 +300,10 @@ def scan(http: requests.Session, cfg: Settings, db, now: datetime | None = None)
                 else:
                     send_telegram(http, cfg, alert_message(signal, bars.index[-1].to_pydatetime()))
                     record_sent(db, signal, now)
+                    if '[CONFIRMED]' in signal.direction:
+                        # WATCH signals do not become hypothetical tracked positions.
+                        bar_end = bars.index[-1].to_pydatetime() + BAR_INTERVAL
+                        open_virtual(db, 'intraday', signal, bar_end.isoformat())
                     alerts += 1
                     LOG.info("Sent %s %s intraday swing watch", sym, signal.direction)
         except requests.HTTPError as exc:
@@ -304,8 +315,8 @@ def scan(http: requests.Session, cfg: Settings, db, now: datetime | None = None)
             LOG.exception("%s intraday swing scan failed", sym)
     if not good:
         raise RuntimeError("No fresh Alpaca data verified for any symbol; check feed, keys and logs")
-    LOG.info("Intraday swing scan complete: %d valid symbols, %d errors, %d new alerts",
-             good, errors, alerts)
+    LOG.info("Intraday swing scan complete: %d valid symbols, %d errors, %d ENTRY alerts, %d EXIT alerts, %d virtual setups remaining",
+             good, errors, alerts, exits, count_open(db, 'intraday'))
     return alerts
 
 

@@ -21,6 +21,7 @@ import pandas as pd
 import requests
 
 from agent import ET, UTC, NYSE, Settings, api_get, make_http, send_telegram
+from swing_exit_tracking import init_exit_tables, open_virtual, review_eod, count_open
 
 LOG = logging.getLogger("swing-scanner")
 
@@ -222,7 +223,9 @@ def scan(http: requests.Session, cfg: Settings, db: sqlite3.Connection,
         LOG.info("Today is not a just-completed NYSE session; no stale alerts")
         return 0
 
-    n, good, errors = 0, 0, 0
+    init_exit_tables(db)
+    n, exits, good, errors = 0, 0, 0, 0
+    LOG.info("EOD virtual swing setups loaded: %d", count_open(db, 'eod'))
     for symbol in cfg.watchlist:
         try:
             daily = fetch_daily_bars(http, cfg, symbol, now)
@@ -235,11 +238,19 @@ def scan(http: requests.Session, cfg: Settings, db: sqlite3.Connection,
                             daily.iloc[-1]["session"], expected)
                 errors += 1
                 continue
+            # Exclude any provisional daily candle before checking exit triggers.
+            daily = daily.loc[daily["session"] <= expected].copy()
             good += 1
+            computed = indicators(daily)
+            exits += review_eod(
+                db, symbol, daily, computed,
+                lambda message: send_telegram(http, cfg, message))
             signal = assess_swing(symbol, daily, expected, cfg.feed)
             if signal and not is_sent(db, signal):
                 send_telegram(http, cfg, message_for_signal(signal))
                 record_sent(db, signal, now)
+                # Open a virtual setup ONLY after a delivered confirmed entry signal.
+                open_virtual(db, 'eod', signal, signal.session.isoformat())
                 n += 1
                 LOG.info("Sent %s %s swing signal", symbol, signal.direction)
         except requests.HTTPError as exc:
@@ -251,8 +262,8 @@ def scan(http: requests.Session, cfg: Settings, db: sqlite3.Connection,
             LOG.exception("%s swing scan failed", symbol)
     if good == 0:
         raise RuntimeError("No symbols produced fresh daily data; check Alpaca keys/feed and API logs")
-    LOG.info("Swing scan completed for %s: %d fresh symbols, %d errors, %d alerts",
-             expected, good, errors, n)
+    LOG.info("Swing scan completed for %s: %d fresh symbols, %d errors, %d ENTRY alerts, %d EXIT alerts, %d virtual setups remaining",
+             expected, good, errors, n, exits, count_open(db, 'eod'))
     return n
 
 
