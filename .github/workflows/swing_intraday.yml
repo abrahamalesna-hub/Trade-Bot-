@@ -51,7 +51,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DATA_FEED: iex
-          WATCHLIST: SPY,QQQ,IWM,NVDA,TSLA,AMD,AMZN,PLTR,HOOD,AAPL,MSFT,META
+          WATCHLIST: SPY,QQQ,IWM,DIA,NVDA,TSLA,AMD,AMZN,PLTR,HOOD,AAPL,MSFT,META,GOOGL,AVGO,MU,SMCI,CRWD,COIN,MSTR,NFLX,SOFI,SHOP,UBER
         shell: bash
         run: |
           if [[ '${{ inputs.test_alert }}' == 'true' ]]; then
