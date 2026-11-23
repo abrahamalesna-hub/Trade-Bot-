@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Day-trading signal WATCH bot with virtual exit tracking. NEVER places orders."""
+"""Day-trading alert bot with quiet CONFIRMED digests and virtual exit tracking. NEVER trades."""
 from __future__ import annotations
 
 import argparse
@@ -42,6 +42,7 @@ class Settings:
     poll_seconds: int
     min_rvol: float
     cooldown_minutes: int
+    max_entries_per_day: int
     db_path: Path
 
     @classmethod
@@ -57,10 +58,11 @@ class Settings:
             tg_chat_id=os.getenv("TELEGRAM_CHAT_ID", "").strip(),
             feed=os.getenv("DATA_FEED", "iex").strip().lower(),
             watchlist=watch,
-            scan_top_active=max(0, min(20, int(os.getenv("TOP_ACTIVE", "10")))),
+            scan_top_active=max(0, min(20, int(os.getenv("TOP_ACTIVE", "0")))),
             poll_seconds=max(30, int(os.getenv("POLL_SECONDS", "60"))),
-            min_rvol=max(1, float(os.getenv("MIN_RVOL", "1.3"))),
-            cooldown_minutes=max(0, int(os.getenv("COOLDOWN_MINUTES", "45"))),
+            min_rvol=max(1, float(os.getenv("MIN_RVOL", "1.6"))),
+            cooldown_minutes=max(0, int(os.getenv("COOLDOWN_MINUTES", "180"))),
+            max_entries_per_day=max(0, int(os.getenv("MAX_ENTRIES_PER_DAY", "2"))),
             db_path=Path(os.getenv("DB_PATH", "alerts.db")),
         )
 
@@ -211,12 +213,7 @@ def assess(symbol: str, df: pd.DataFrame, now: datetime, cfg: Settings) -> Optio
 
 def assess_levels(symbol: str, bars: pd.DataFrame, now: datetime,
                   cfg: Settings) -> tuple[list[Signal], str]:
-    """Evaluate four interpretable checks for each direction on one completed 5m bar.
-
-    WATCH = exactly 3 of 4; CONFIRMED = 4 of 4. This is rule-based
-    confirmation, NOT evidence a trade will be profitable. Signal states
-    are eligible once per NYSE session (deduped in the persisted database).
-    """
+    """WATCH = 3/4, CONFIRMED = 4/4. Ranking is not a profit guarantee."""
     if len(bars) < 35:
         return [], "insufficient completed candles"
     if (bars.index[-1] - bars.index[-2] != pd.Timedelta(minutes=5) or
@@ -237,7 +234,6 @@ def assess_levels(symbol: str, bars: pd.DataFrame, now: datetime,
     atr = float(last["atr"])
     if price <= 0 or not pd.notna(atr) or atr <= 0:
         return [], "nonpositive price/ATR"
-
     rsi = float(last["rsi"])
     rvol = float(last["rvol"])
     sides = (
@@ -256,18 +252,15 @@ def assess_levels(symbol: str, bars: pd.DataFrame, now: datetime,
         diagnostics.append(f"{side} {len(passed)}/4; missing: {', '.join(failed) if failed else 'none'}")
         if len(passed) < 3:
             continue
-        # Sending only the highest tier at a given scan avoids doubled notices.
         level = "CONFIRMED" if len(passed) == 4 else "WATCH"
         dist = max(1.5 * atr, price * 0.001)
         stop = price - dist if side == "BUY" else price + dist
         target = price + 2 * dist if side == "BUY" else max(0.0, price - 2 * dist)
         if target <= 0:
             continue
-        out.append(Signal(
-            symbol, side, t, price, float(last["ema9"]), float(last["ema21"]),
-            float(last["vwap"]), rsi, rvol, atr, stop, target, cfg.feed,
-            level=level, matched=passed, missing=failed,
-        ))
+        out.append(Signal(symbol, side, t, price, float(last["ema9"]), float(last["ema21"]),
+                          float(last["vwap"]), rsi, rvol, atr, stop, target, cfg.feed,
+                          level=level, matched=passed, missing=failed))
     return out, " | ".join(diagnostics)
 
 
@@ -289,10 +282,7 @@ def _storage_side(sig: Signal) -> str:
 
 
 def is_duplicate(db: sqlite3.Connection, sig: Signal, cfg: Settings) -> bool:
-    """Maximum one alert per symbol, direction, level, exchange session.
-
-    Reuses the historical `alerts` DB schema so old cache entries remain valid.
-    """
+    """One alert per symbol / direction / tier / NYSE session (same schema as old bot)."""
     rows = db.execute("SELECT bar_time FROM alerts WHERE symbol=? AND side=? ORDER BY sent_at DESC LIMIT 10",
                       (sig.symbol, _storage_side(sig))).fetchall()
     day = sig.bar_time.astimezone(ET).date()
@@ -305,9 +295,24 @@ def mark_sent(db: sqlite3.Connection, sig: Signal) -> None:
     db.commit()
 
 
+def entries_sent_today(db: sqlite3.Connection, now: datetime) -> int:
+    """Counts previously delivered CONFIRMED entries using persisted NYSE-day bar timestamps."""
+    day = now.astimezone(ET).date()
+    rows = db.execute("SELECT bar_time FROM alerts WHERE side LIKE 'CONFIRMED:%'").fetchall()
+    count = 0
+    for (bar,) in rows:
+        try:
+            if datetime.fromisoformat(bar).astimezone(ET).date() == day:
+                count += 1
+        except (ValueError, TypeError):
+            LOG.warning("Ignoring invalid historical timestamp: %s", bar)
+    return count
+
+
 def format_alert(sig: Signal) -> str:
+    """Original detailed formatter preserved for debugging or manual review."""
     closed = (sig.bar_time + timedelta(minutes=5)).astimezone(ET)
-    icon = "🟢" if sig.side == "BUY" else "🔴"
+    icon = "ð¢" if sig.side == "BUY" else "ð´"
     tier_note = ("Early watch: 3/4 checks align; not a confirmed entry."
                  if sig.level == "WATCH" else
                  "Rule-confirmed: 4/4 technical checks align; not a guaranteed trade.")
@@ -325,6 +330,102 @@ def format_alert(sig: Signal) -> str:
             f"Alpaca {sig.feed.upper()} single-exchange feed; volume may not represent all US trading.\n"
             f"Chart: https://www.tradingview.com/symbols/{sig.symbol}/\n"
             "Research watch only. Verify news, liquidity, current price and risks. No orders placed.")
+
+
+
+
+@dataclass(frozen=True)
+class SwingContext:
+    """Daily-chart context ONLY; not a separately generated swing-trade entry."""
+    classification: str
+    as_of: Optional[str] = None
+    explanation: str = ""
+
+
+def fetch_daily_bars(http: requests.Session, cfg: Settings, sym: str,
+                     now: datetime) -> pd.DataFrame:
+    """Daily bars for a separate swing trend check; EXCLUDES today's incomplete bar."""
+    d = api_get(http, cfg, f"/v2/stocks/{quote(sym, safe='')}/bars", {
+        "timeframe": "1Day", "feed": cfg.feed, "adjustment": "split",
+        "start": (now - timedelta(days=280)).isoformat().replace("+00:00", "Z"),
+        "end": now.isoformat().replace("+00:00", "Z"),
+        "limit": 10000, "sort": "asc",
+    })
+    vals = d.get("bars", [])
+    if not vals:
+        return pd.DataFrame()
+    df = pd.DataFrame(vals)
+    if not all(c in df.columns for c in ("t", "c")):
+        return pd.DataFrame()
+    df["t"] = pd.to_datetime(df["t"], utc=True)
+    df["close"] = pd.to_numeric(df["c"], errors="coerce")
+    df = df.dropna(subset=["t", "close"]).sort_values("t").drop_duplicates("t").set_index("t")
+    # A daily candle that belongs to the current NYSE date may still be forming.
+    et_day = now.astimezone(ET).date()
+    df = df.loc[[d < et_day for d in df.index.tz_convert(ET).date]]
+    return df[["close"]].copy()
+
+
+def assess_swing_context(bars: pd.DataFrame, side: str,
+                         now: datetime) -> SwingContext:
+    """Trend alignment is not a swing entry signal or a holding instruction."""
+    if bars.empty or len(bars) < 70:
+        return SwingContext("UNAVAILABLE", explanation="Insufficient completed daily candles")
+    last_day = bars.index[-1].tz_convert(ET).date()
+    if (now.astimezone(ET).date() - last_day).days > 7:
+        return SwingContext("UNAVAILABLE", explanation="Daily data too old")
+    closes = pd.to_numeric(bars["close"], errors="coerce").dropna()
+    if len(closes) < 70 or (closes <= 0).any():
+        return SwingContext("UNAVAILABLE", explanation="Invalid daily close series")
+    e10 = closes.ewm(span=10, adjust=False, min_periods=10).mean()
+    e20 = closes.ewm(span=20, adjust=False, min_periods=20).mean()
+    e50 = closes.ewm(span=50, adjust=False, min_periods=50).mean()
+    bullish = side == "BUY"
+    if bullish:
+        short = (closes.iloc[-1] > e10.iloc[-1] > e20.iloc[-1]
+                 and e10.iloc[-1] > e10.iloc[-6])
+        longer = (closes.iloc[-1] > e20.iloc[-1] > e50.iloc[-1]
+                  and e50.iloc[-1] > e50.iloc[-11])
+    else:
+        short = (closes.iloc[-1] < e10.iloc[-1] < e20.iloc[-1]
+                 and e10.iloc[-1] < e10.iloc[-6])
+        longer = (closes.iloc[-1] < e20.iloc[-1] < e50.iloc[-1]
+                  and e50.iloc[-1] < e50.iloc[-11])
+    if longer:
+        label = "LONGER-TERM SWING BIAS (2â8 weeks)"
+        note = "daily 20/50 EMA trend aligned" + ("; short-term aligned too" if short else "; short-term not aligned")
+    elif short:
+        label = "SHORT-TERM SWING BIAS (2â10 trading days)"
+        note = "daily 10/20 EMA trend aligned; longer trend unconfirmed"
+    else:
+        label = "NO SAME-DIRECTION SWING CONFIRMATION"
+        note = "daily-chart filters not aligned with intraday direction"
+    return SwingContext(label, as_of=last_day.isoformat(), explanation=note)
+
+
+def format_entry_digest(chosen: list[Signal], now: datetime, candidates: int,
+                        contexts: Optional[dict[str, SwingContext]] = None) -> str:
+    """A single succinct Telegram notification with no more than 2 ranked setups by default."""
+    timestamp = now.astimezone(ET)
+    contexts = contexts or {}
+    lines = [f"ð DAY-TRADE TOP {len(chosen)} | {timestamp:%b %d, %I:%M %p} ET",
+             f"CONFIRMED (4/4) only Â· {candidates} qualifying Â· ranked by RVOL"]
+    for i, s in enumerate(chosen, 1):
+        icon = "ð¢" if s.side == "BUY" else "ð´"
+        close_time = (s.bar_time + timedelta(minutes=5)).astimezone(ET)
+        lines.extend([
+            f"{i}. {icon} {s.symbol} {s.side} | ${s.price:.2f} reference",
+            f"   5m close {close_time:%I:%M %p} ET Â· RVOL {s.rvol:.1f}x Â· RSI {s.rsi:.0f}",
+            f"   Type: DAY TRADE Â· 5-minute setup Â· same-day exit",
+            f"   Stop ref ${s.stop:.2f} Â· 2R target ${s.target:.2f}",
+            f"   Daily-chart context: {contexts.get(s.symbol, SwingContext('NOT CHECKED')).classification}",
+        ])
+        ctx = contexts.get(s.symbol)
+        if ctx is not None and ctx.as_of:
+            lines.append(f"   Daily bar {ctx.as_of} Â· {ctx.explanation}")
+    lines.append("Swing bias is trend context ONLY, not a swing entry/exit signal. Day-trade tracker ends same session.")
+    lines.append("Research only; Alpaca reference prices may be incomplete/stale. Verify Merrill live quotes. No orders.")
+    return "\n".join(lines)
 
 
 def send_telegram(http: requests.Session, cfg: Settings, message: str) -> bool:
@@ -358,7 +459,6 @@ def active_symbols(http: requests.Session, cfg: Settings) -> list[str]:
     except Exception as exc:
         LOG.warning("Top-active screener failed (%s); using watchlist", exc)
     return symbols[:35]
-
 
 
 @dataclass(frozen=True)
@@ -443,16 +543,12 @@ def evaluate_exit(tracked: TrackedSetup, bars: pd.DataFrame,
     """
     current_session = now.astimezone(ET).date()
     if tracked.entry_bar.astimezone(ET).date() != current_session:
-        return _notice(tracked, now, None, "TRACKING EXPIRED — previous session, fill/exit unknown"), None
+        return _notice(tracked, now, None, "TRACKING EXPIRED â previous session, fill/exit unknown"), None
     if bars.empty:
         return None, None
     recent = bars.loc[bars.index > tracked.last_checked_bar]
-    # Never evaluate the signal candle or prices from before the entry reference.
     recent = recent.loc[recent.index > tracked.entry_bar]
     if recent.empty:
-        # If the previous run already checked the last candle, still send the
-        # once-per-day time-exit watch when the close approaches. This uses a
-        # recent completed bar, not a fabricated executable close price.
         last = bars.index[-1].to_pydatetime()
         fresh = timedelta(0) <= now - (last + timedelta(minutes=5)) <= timedelta(minutes=10)
         if (now >= session_close - timedelta(minutes=12) and fresh and
@@ -476,8 +572,6 @@ def evaluate_exit(tracked: TrackedSetup, bars: pd.DataFrame,
             return _notice(tracked, t, tracked.stop, "STOP reference touched"), last_checked
         if target_hit:
             return _notice(tracked, t, tracked.target, "2R TARGET reference touched"), last_checked
-        # A close-based reversal requires trend weakness AND loss of VWAP,
-        # rather than a single noisy 5-minute dip.
         if all(pd.notna(bar[f]) for f in ("ema9", "ema21", "vwap", "rsi")):
             close = float(bar["close"])
             if is_long:
@@ -488,7 +582,6 @@ def evaluate_exit(tracked: TrackedSetup, bars: pd.DataFrame,
                     close > float(bar["ema9"]) and close > float(bar["vwap"]) and float(bar["rsi"]) > 50))
             if reversal:
                 return _notice(tracked, t, close, "MOMENTUM / TREND invalidation"), last_checked
-    # All day-trade virtual setups end before the close, not overnight.
     if last_checked is not None and now >= session_close - timedelta(minutes=12):
         return _notice(tracked, last_checked, float(x.loc[last_checked, "close"]),
                        "END-OF-DAY time exit reference"), last_checked
@@ -500,8 +593,8 @@ def format_exit_notice(n: ExitNotice) -> str:
     when = (n.time + timedelta(minutes=5)).astimezone(ET) if n.reference_price is not None else clock
     side_label = "BULLISH/LONG" if n.side == "BUY" else "BEARISH/SHORT"
     value = (f"Reference exit: ${n.reference_price:,.2f} (NOT a fill quote)" if
-             n.reference_price is not None else "Exit price unknown — check your brokerage")
-    return (f"🚪 VIRTUAL SETUP EXIT WATCH | {n.symbol} | {side_label}\n"
+             n.reference_price is not None else "Exit price unknown â check your brokerage")
+    return (f"ðª DAY-TRADE VIRTUAL EXIT WATCH | {n.symbol} | {side_label}\n"
             f"Reason: {n.reason}\n"
             f"5-min reference time: {when:%Y-%m-%d %I:%M %p} ET\n"
             f"Original alert reference: ${n.entry_reference:,.2f}\n"
@@ -530,7 +623,6 @@ def check_and_alert_exit(http: requests.Session, cfg: Settings,
         advance_setup(db, sym, last)
     return False
 
-
 def run_scan(http: requests.Session, cfg: Settings, db: sqlite3.Connection,
              now: Optional[datetime] = None) -> int:
     now = now or datetime.now(UTC)
@@ -542,21 +634,23 @@ def run_scan(http: requests.Session, cfg: Settings, db: sqlite3.Connection,
     if not (op + timedelta(minutes=15) <= now <= cl - timedelta(minutes=5)):
         LOG.info("Outside active intraday scan window: %s", now.astimezone(ET))
         return 0
-    count = 0
+
     exit_alerts = 0
     successes = 0
     evaluable = 0
     failures = 0
+    candidates: list[Signal] = []
     symbols = active_symbols(http, cfg)
-    # Cache persists alerts.db across GitHub runs (best effort, not brokerage-grade).
     virtual_count = db.execute("SELECT COUNT(*) FROM tracked_setups").fetchone()[0]
     LOG.info("Tracked hypothetical setups loaded from previous runs: %d", virtual_count)
+
+    # IMPORTANT: ALWAYS check exits, even when today's entry-alert budget is exhausted.
     for sym in symbols:
         try:
             bars = fetch_bars(http, cfg, sym, now)
             successes += 1
             if bars.empty:
-                LOG.warning("%s: API responded, but no completed regular-session 5-minute bars were returned", sym)
+                LOG.warning("%s: no completed regular-session 5-minute bars", sym)
                 continue
             last_bar = bars.index[-1].to_pydatetime()
             minutes_since_close = (now - (last_bar + timedelta(minutes=5))).total_seconds() / 60
@@ -573,41 +667,75 @@ def run_scan(http: requests.Session, cfg: Settings, db: sqlite3.Connection,
                 evaluable += 1
                 if check_and_alert_exit(http, cfg, db, sym, bars, now, cl):
                     exit_alerts += 1
+                    # Avoid a contradictory entry immediately after an exit on this scan.
+                    continue
+
+            # WATCH (3/4 criteria) signals are logged but never Telegram-notified.
             signals, diagnostic = assess_levels(sym, bars, now, cfg)
             LOG.info("%s criteria: %s", sym, diagnostic)
+            if now >= cl - timedelta(minutes=30):
+                continue  # Don't open new virtual day trades near the close.
             for sig in signals:
-                # Don't open new virtual day trades in the last 30 minutes.
-                if sig.level == "CONFIRMED" and now >= cl - timedelta(minutes=30):
-                    LOG.info("%s: skipped near-close CONFIRMED entry alert", sym)
+                if sig.level != "CONFIRMED":
                     continue
                 if is_duplicate(db, sig, cfg):
-                    LOG.info("%s %s %s suppressed: already alerted this session", sym, sig.level, sig.side)
+                    LOG.info("%s %s %s suppressed: already alerted this session",
+                             sym, sig.level, sig.side)
                     continue
-                msg = format_alert(sig)
-                if send_telegram(http, cfg, msg):
-                    mark_sent(db, sig)
-                    if sig.level == "CONFIRMED":
-                        register_confirmed_setup(db, sig)
-                    count += 1
-                    LOG.info("Sent %s %s %s", sym, sig.level, sig.side)
+                if load_setup(db, sig.symbol) is not None:
+                    LOG.info("%s skipped: an earlier hypothetical setup is still tracked", sig.symbol)
+                    continue
+                candidates.append(sig)
         except requests.HTTPError as exc:
             failures += 1
-            LOG.warning("%s request failed: HTTP %s", sym, exc.response.status_code if exc.response is not None else "?")
+            LOG.warning("%s request failed: HTTP %s", sym,
+                        exc.response.status_code if exc.response is not None else "?")
         except Exception:
             failures += 1
             LOG.exception("%s scan failed", sym)
-    LOG.info("DATA HEALTH: %d/%d symbols fetched, %d had fresh continuous bars, %d errors; %d new alert(s)",
-             successes, len(symbols), evaluable, failures, count)
+
+    LOG.info("DATA HEALTH: %d/%d symbols fetched, %d had fresh continuous bars, %d errors",
+             successes, len(symbols), evaluable, failures)
     if successes == 0:
         raise RuntimeError("No market data could be fetched. Check Alpaca credentials, feed and API errors above.")
     if evaluable == 0:
         raise RuntimeError("No symbols had enough fresh continuous bars to evaluate. Check IEX data coverage / timestamps above.")
-    LOG.info("Scan complete: %d entry/watch alert(s), %d virtual exit alert(s)", count, exit_alerts)
-    return count
+
+    used_today = entries_sent_today(db, now)
+    remaining = max(0, cfg.max_entries_per_day - used_today)
+    # RVOL prioritizes stronger participation; it is NOT a calibrated profitability score.
+    ranked = sorted(candidates, key=lambda s: (
+        -s.rvol, -abs(s.ema9 - s.ema21) / max(s.price, 0.01), s.symbol))
+    chosen = ranked[:remaining]
+
+    # Check daily swing context only for chosen entries (at most 2 by default).
+    # Failed/insufficient daily data is labeled UNAVAILABLE, never guessed.
+    swing_context: dict[str, SwingContext] = {}
+    for sig in chosen:
+        try:
+            day_bars = fetch_daily_bars(http, cfg, sig.symbol, now)
+            swing_context[sig.symbol] = assess_swing_context(day_bars, sig.side, now)
+        except Exception as exc:
+            LOG.warning("%s: daily trend context unavailable: %s", sig.symbol, exc)
+            swing_context[sig.symbol] = SwingContext("UNAVAILABLE", explanation="Daily data request failed")
+
+    if chosen:
+        # Send only ONE concise message and record entries only after Telegram accepts it.
+        if send_telegram(http, cfg, format_entry_digest(chosen, now, len(candidates), swing_context)):
+            for sig in chosen:
+                mark_sent(db, sig)
+                register_confirmed_setup(db, sig)
+            LOG.info("Quiet digest sent: %d candidates, %d entries in a single message", len(candidates), len(chosen))
+    else:
+        LOG.info("No new entries: %d confirmed candidates; daily budget %d/%d",
+                 len(candidates), used_today, cfg.max_entries_per_day)
+    LOG.info("Scan complete: %d new confirmed entries (%d used today), %d virtual exit alert(s)",
+             len(chosen), used_today + len(chosen), exit_alerts)
+    return len(chosen)
 
 
 def main() -> None:
-    p = argparse.ArgumentParser(description="5-minute day-trading alert bot (never trades)")
+    p = argparse.ArgumentParser(description="Quiet 5-minute day-trading alert bot (never trades)")
     p.add_argument("--once", action="store_true", help="Run one scan now, then exit")
     p.add_argument("--test-alert", action="store_true", help="Send an obviously labeled connection test")
     args = p.parse_args()
@@ -621,7 +749,10 @@ def main() -> None:
         p.error("DATA_FEED must be 'iex' or 'sip'")
     http = make_http()
     if args.test_alert:
-        send_telegram(http, cfg, "✅ TEST ONLY — Trading signal bot is connected. This is NOT a buy or sell alert.")
+        try:
+            send_telegram(http, cfg, "â TEST ONLY â Quiet day-trading bot connected. No trade signal; no orders placed.")
+        finally:
+            http.close()
         print("Test sent")
         return
     db = create_db(cfg)
@@ -645,4 +776,3 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
