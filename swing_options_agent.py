@@ -187,33 +187,219 @@ def technical_ideas(sym, df):
                         'signal_close': float(a.close), 'atr': float(a.atr),
                         'rsi': float(a.rsi), 'ema10': float(a.e10),
                         'ema20': float(a.e20), 'ema50': float(a.e50),
-                        'score': (2 if breakout else 1) + abs(float(a.rsi)-50)/25})
+                        'score': (2 if breakout else 1) + max(0, 1 - abs(float(a.rsi) - (61 if bull else 39))/20)})
+    # Oversold reversal ideas are not automatic BUY signals. Fresh market,
+    # relative-strength and prior-high confirmation are checked later.
+    if (float(a.rsi) <= 42 and float(a.close) < float(a.e10) and
+            float(a.close) < float(a.e20) and float(a.atr) > 0):
+        out.append({'symbol': sym, 'horizon': 'SHORT', 'side': 'BULLISH',
+                    'pattern': 'OVERSOLD REVERSAL', 'closed_date': str(a.day),
+                    'signal_close': float(a.close), 'atr': float(a.atr),
+                    'rsi': float(a.rsi), 'ema10': float(a.e10),
+                    'ema20': float(a.e20), 'ema50': float(a.e50),
+                    'prior_high': float(a.high), 'score': 1.3})
     return out
 
 
-def qualify_current(idea, trade):
-    # Do not send yesterday's breakout as actionable if it has moved too far.
-    if not trade:
+def rsi_value(df):
+    """Last Wilder-style 14-session RSI, based only on completed daily bars."""
+    delta = df['close'].astype(float).diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    loss = (-delta).clip(lower=0).ewm(alpha=1 / 14, min_periods=14, adjust=False).mean()
+    if pd.isna(gain.iloc[-1]) or pd.isna(loss.iloc[-1]):
+        return None
+    if loss.iloc[-1] == 0:
+        return 100.0 if gain.iloc[-1] > 0 else 50.0
+    return float(100 - 100 / (1 + gain.iloc[-1] / loss.iloc[-1]))
+
+
+def fetch_fear_greed(now):
+    """Best-effort, timestamp-validated CNN reading; never assume a current score.
+
+    This is an undocumented/public webpage data endpoint, so failures are normal.
+    When it fails, market-price-based context still works; do not invent a score.
+    """
+    if os.getenv('ENABLE_CNN_FEAR_GREED', 'true').strip().lower() == 'false':
+        return None
+    url = 'https://production.dataviz.cnn.io/index/fearandgreed/graphdata'
+    try:
+        resp = requests.get(url, timeout=8, headers={
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/124 Safari/537.36',
+            'Origin': 'https://www.cnn.com', 'Referer': 'https://www.cnn.com/',
+            'Accept': 'application/json, text/plain, */*'})
+        resp.raise_for_status()
+        d = resp.json().get('fear_and_greed') or {}
+        score = float(d['score'])
+        time_seen = timestamp(d.get('timestamp'))
+        if not (math.isfinite(score) and 0 <= score <= 100 and time_seen):
+            return None
+        age_hours = (now - time_seen).total_seconds() / 3600
+        if not (-1 <= age_hours <= 96):
+            LOG.warning('Fear & Greed reading is stale or future-dated; ignoring')
+            return None
+        return {'score': score, 'time': time_seen.isoformat(),
+                'rating': str(d.get('rating', 'unknown')).lower()}
+    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+        LOG.warning('Fear & Greed index unavailable; using price-derived market context (%s)', exc)
+        return None
+
+
+def market_context(s, now, feed):
+    """Fresh broad-market filter; never use Friday's market regime alone on Monday."""
+    benchmarks = {}
+    for sym in ('SPY', 'QQQ'):
+        hist = completed_daily(s, sym, now, feed)
+        live = latest_stock_trade(s, sym, now, feed)
+        if hist.empty or live is None:
+            raise RuntimeError(f'Cannot obtain fresh {sym} market benchmark: refusing new entry signals')
+        close = float(hist.iloc[-1]['close'])
+        ret = live['price'] / close - 1
+        rsi = rsi_value(hist)
+        recent_high = float(hist['high'].iloc[-20:].max())
+        drawdown = close / recent_high - 1
+        benchmarks[sym] = {'ret': ret, 'rsi': rsi, 'drawdown': drawdown,
+                           'price': live['price'], 'previous_close': close}
+    mean_ret = (benchmarks['SPY']['ret'] + benchmarks['QQQ']['ret']) / 2
+    r1, r2 = benchmarks['SPY']['ret'], benchmarks['QQQ']['ret']
+    if r1 >= 0.006 and r2 >= 0.006:
+        regime = 'RALLY'
+    elif r1 <= -0.006 and r2 <= -0.006:
+        regime = 'SELLOFF'
+    else:
+        regime = 'MIXED'
+    fear = fetch_fear_greed(now)
+    proxy_oversold = all((b['rsi'] is not None and b['rsi'] <= 41) or
+                         b['drawdown'] <= -0.075 for b in benchmarks.values())
+    extreme_fear = bool(fear and fear['score'] <= 25)
+    return {'benchmarks': benchmarks, 'ret': mean_ret, 'regime': regime,
+            'fear': fear, 'oversold_proxy': proxy_oversold,
+            'fearful_or_oversold': extreme_fear or proxy_oversold}
+
+
+POSITIVE_NEWS = (
+    r'\breinstat(?:e|ed|es|ing)\b', r'\breturn(?:s|ed)? as (?:the )?ceo\b',
+    r'\brais(?:e|es|ed) (?:its |the )?(?:guidance|forecast|outlook)\b',
+    r'\bupgrad(?:e|es|ed)\b', r'\bbeats? (?:earnings|estimates|expectations)\b',
+    r'\b(?:fda|regulatory) approval\b', r'\bannounces? (?:a )?buyback\b',
+)
+NEGATIVE_NEWS = (
+    r'\b(?:ceo|chief executive) (?:resigns|resigned|steps down)\b',
+    r'\b(?:cuts?|cutting|lowers?|lowered) (?:its |the )?(?:guidance|outlook|forecast)\b',
+    r'\bdowngrad(?:e|es|ed)\b', r'\bmiss(?:es|ed) (?:earnings|estimates|expectations)\b',
+    r'\b(?:fraud|bankruptcy|investigation|sec charges)\b',
+)
+
+
+def news_catalyst(s, symbol, now):
+    """Limited recent Alpaca headlines; conservative keyword matching only.
+
+    Articles are not a reliable substitute for interpreting news or an earnings calendar.
+    A headline with no understood catalyst is neutral; unknown access is explicit.
+    """
+    try:
+        result = api_get(s, '/v1beta1/news', {
+            'symbols': symbol,
+            'start': (now - timedelta(hours=72)).isoformat().replace('+00:00', 'Z'),
+            'end': now.isoformat().replace('+00:00', 'Z'),
+            'limit': 30, 'sort': 'DESC'})
+        articles = result.get('news') or []
+        recognized = []
+        for a in articles:
+            if symbol not in (a.get('symbols') or []):
+                continue
+            when = timestamp(a.get('created_at') or a.get('updated_at'))
+            if not when or not (timedelta(0) <= now-when <= timedelta(hours=72)):
+                continue
+            headline = str(a.get('headline') or '')[:160]
+            pos = any(re.search(p, headline, re.I) for p in POSITIVE_NEWS)
+            neg = any(re.search(p, headline, re.I) for p in NEGATIVE_NEWS)
+            if pos == neg:
+                continue
+            recognized.append({'direction': 'BULLISH' if pos else 'BEARISH',
+                               'headline': headline, 'when': when.isoformat()})
+        if not recognized:
+            return {'direction': 'NEUTRAL', 'headline': None, 'available': True}
+        recognized.sort(key=lambda x: x['when'], reverse=True)
+        return {**recognized[0], 'available': True}
+    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
+        LOG.warning('%s news data unavailable (%s); no claim of catalyst verification', symbol, exc)
+        return {'direction': 'UNKNOWN', 'headline': None, 'available': False}
+
+
+def sentiment_rank(idea, context, catalyst):
+    """Rank only after fresh directional confirmation and news veto."""
+    if catalyst['direction'] in ('BULLISH', 'BEARISH') and catalyst['direction'] != idea['side']:
+        return None  # Recognized, fresh, conflicting company-specific news.
+    score = float(idea['score'])
+    # Reward relative strength in correct direction, not just oversold/overbought RSI.
+    aligned_relative = idea['relative_return'] * (1 if idea['side'] == 'BULLISH' else -1)
+    score += max(-2.0, min(2.0, aligned_relative * 35))
+    if context['regime'] == 'RALLY':
+        score += 1.0 if idea['side'] == 'BULLISH' else -1.1
+        if context['fearful_or_oversold'] and idea['side'] == 'BULLISH':
+            score += 0.9
+    elif context['regime'] == 'SELLOFF':
+        score += 1.0 if idea['side'] == 'BEARISH' else -1.0
+    if catalyst['direction'] == idea['side']:
+        score += 1.0
+    if catalyst['direction'] == 'UNKNOWN':
+        score -= 0.25
+    # Prevent chasing deeply oversold puts or overbought calls.
+    if idea['side'] == 'BEARISH' and idea['rsi'] < 32:
+        score -= 1.5
+    if idea['side'] == 'BULLISH' and idea['rsi'] > 74:
+        score -= 1.5
+    return score
+
+
+def qualify_current(idea, trade, context=None):
+    """Require today's market move to validate the previous session's chart signal.
+
+    Especially important after a violent countertrend rebound or catalyst.
+    """
+    if not trade or context is None:
         return None
     idea = dict(idea)
     price = trade['price']
-    move = (price / idea['signal_close'] - 1)
-    if abs(move) > 0.025:
+    change = price / idea['signal_close'] - 1
+    relative = change - context['ret']
+    rally, selloff = context['regime'] == 'RALLY', context['regime'] == 'SELLOFF'
+    rebound = idea['pattern'] == 'OVERSOLD REVERSAL'
+    if rebound:
+        # A rebound requires confirmed oversold context AND actual upside momentum.
+        if not (context['fearful_or_oversold'] and rally and
+                price > idea['prior_high'] * 1.002 and change >= 0.01 and
+                relative >= 0.008):
+            return None
+    elif idea['side'] == 'BULLISH':
+        if price < idea['ema20'] or change < 0.002:
+            return None
+        if selloff and relative < 0.018:
+            return None
+        if rally and relative < -0.012:
+            return None
+    else:
+        if price > idea['ema20'] or change > -0.003:
+            return None
+        if rally and relative > -0.025:
+            return None
+        if not rally and relative > 0.005:
+            return None
+        # Be extra careful buying puts when deeply oversold during a fear rally.
+        if idea['rsi'] < 30 and (rally or change > -0.015):
+            return None
+    # Do not chase unusually large moves even when a catalyst is present.
+    max_move = min(0.08, max(0.03, 1.6 * idea['atr'] / idea['signal_close']))
+    if abs(change) > max_move:
         return None
-    # Preserve original bullish/bearish directional invalidation.
-    if idea['side'] == 'BULLISH' and price < idea['ema20']:
-        return None
-    if idea['side'] == 'BEARISH' and price > idea['ema20']:
-        return None
-    mult = 1.6 if idea['horizon'] == 'SHORT' else 2.1
-    risk = mult * idea['atr']
+    risk = (1.6 if idea['horizon'] == 'SHORT' else 2.1) * idea['atr']
     stop = price - risk if idea['side'] == 'BULLISH' else price + risk
     target = price + 2*risk if idea['side'] == 'BULLISH' else price - 2*risk
-    # Do not promote extreme-risk ATR setups to concise top-pick alerts.
-    if stop <= 0 or target <= 0 or (100 * risk / price) > (9 if idea['horizon'] == 'SHORT' else 15):
+    if stop <= 0 or target <= 0 or 100*risk/price > (9 if idea['horizon']=='SHORT' else 15):
         return None
     idea.update(price=price, trade_time=trade['time'], stop=stop, target=target,
-                risk_pct=100*risk/price, option=None)
+                risk_pct=100*risk/price, option=None, session_return=change,
+                relative_return=relative)
     return idea
 
 
@@ -377,27 +563,32 @@ def format_exit(tracked, reason, live, now):
 
 
 def format_entry(idea, feed):
-    horizon = 'SHORT-TERM SWING (2–10 trading days)' if idea['horizon']=='SHORT' else 'LONGER-TERM SWING (2–8 weeks)'
-    action = 'BUY / BULLISH' if idea['side']=='BULLISH' else 'BEARISH / consider PUT'
-    lines = [f"{horizon} | {idea['symbol']} | {action}",
-             f"Setup: {idea['pattern']} on {idea['closed_date']} completed daily bar",
-             f"Stock reference ${idea['price']:.2f} | RSI {idea['rsi']:.0f} | 20EMA ${idea['ema20']:.2f}",
-             f"Stock stop ${idea['stop']:.2f} | 2R target ${idea['target']:.2f} | indicative risk {idea['risk_pct']:.1f}%",
-             f"Stock trade time {timestamp(idea['trade_time']).astimezone(ET):%b %d %I:%M %p} ET"]
+    """Compact, manual-execution-ready digest item (never a brokerage order)."""
+    horizon = 'SHORT SWING (2–10d)' if idea['horizon'] == 'SHORT' else 'LONG SWING (2–8wk)'
+    direction = 'BULLISH / CALL' if idea['side'] == 'BULLISH' else 'BEARISH / PUT'
+    tm = timestamp(idea['trade_time']).astimezone(ET)
+    lines = [
+        f"{horizon} | {idea['symbol']} | {direction}",
+        f"Stock ${idea['price']:.2f} at {tm:%I:%M %p} ET | stop ${idea['stop']:.2f} | target ${idea['target']:.2f}",
+        f"{idea['pattern']} | market {idea.get('market_label', 'unavailable')} | rel. {idea.get('relative_return', 0):+.1%}",
+    ]
+    c = idea.get('catalyst') or {}
+    if c.get('headline'):
+        lines.append(f"Catalyst: {c['headline'][:95]}")
+    elif not c.get('available', True):
+        lines.append('News check: unavailable')
     o = idea.get('option')
     if o:
-        provenance = 'OPRA market quote' if feed == 'opra' else 'INDICATIVE (not a firm/executable quote)'
+        kind = 'C' if o['kind'] == 'CALL' else 'P'
+        source = 'OPRA' if feed == 'opra' else 'INDICATIVE'
         lines.extend([
-            f"OPTION CANDIDATE: BUY TO OPEN {o['kind']} ${o['strike']:g} exp {o['expiration']} ({o['dte']} DTE)",
-            f"Exact OCC symbol: {o['contract']}",
-            f"Bid ${o['bid']:.2f} / ask ${o['ask']:.2f} | est. ask cost ${o['ask']*100:.0f}/standard contract (verify multiplier)",
-            f"Delta {o['delta']:.2f} | IV {o['iv']:.0%} | spread {o['spread']:.1%}",
-            f"Quote {timestamp(o['quote_time']).astimezone(ET):%b %d %I:%M %p} ET | {provenance}",
-            'OPTION EXIT: Monitor the underlying stock invalidation and premium; stock stop/target are NOT option stop prices.'
+            f"OPTION: BUY {kind} ${o['strike']:g} exp {o['expiration']} ({o['dte']} DTE)",
+            f"{o['contract']}",
+            f"Ref bid/ask ${o['bid']:.2f}/${o['ask']:.2f} | Δ{o['delta']:.2f} | IV {o['iv']:.0%} | {source}",
+            f"Quote {timestamp(o['quote_time']).astimezone(ET):%I:%M %p} ET | verify in Merrill",
         ])
     else:
-        lines.append('OPTION: No contract passed live data/liquidity filters; do not infer strike or premium.')
-    lines.append('Verify earnings, live Merrill quotes, liquidity and firm preclearance. Research idea only; no orders.')
+        lines.append('OPTION: No contract passed quote/liquidity checks.')
     return '\n'.join(lines)
 
 
@@ -415,6 +606,17 @@ def run_scan(s, now, preview=False):
                                  if re.fullmatch(r'[A-Z][A-Z0-9.\-]{0,9}', t.strip().upper())))
     if not symbols:
         raise RuntimeError('WATCHLIST is empty')
+    # Benchmark failure is a hard block on NEW entries, not on exit checks.
+    market = None
+    try:
+        market = market_context(s, now, feed)
+        LOG.info('Market regime %s | SPY %+.2f%% QQQ %+.2f%% | Fear/Greed %s | oversold proxy %s',
+                 market['regime'], market['benchmarks']['SPY']['ret']*100,
+                 market['benchmarks']['QQQ']['ret']*100,
+                 f"{market['fear']['score']:.1f}" if market['fear'] else 'unavailable',
+                 market['oversold_proxy'])
+    except Exception as exc:
+        LOG.error('Benchmark sentiment unavailable: entry scan disabled; virtual exits still checked (%s)', exc)
     candidates, history, live_by_symbol = [], {}, {}
     success = 0
     for sym in symbols:
@@ -424,13 +626,12 @@ def run_scan(s, now, preview=False):
                 continue
             success += 1
             history[sym] = bars
-            # Fetch fresh stock print only for potential entries or exit-watch setups.
-            raw_ideas = technical_ideas(sym, bars)
+            raw_ideas = technical_ideas(sym, bars) if market else []
             tracked_exists = any(v['symbol']==sym for v in state['tracked'].values())
             if raw_ideas or tracked_exists:
                 live_by_symbol[sym] = latest_stock_trade(s, sym, now, feed)
             for idea in raw_ideas:
-                qualified = qualify_current(idea, live_by_symbol.get(sym))
+                qualified = qualify_current(idea, live_by_symbol.get(sym), market)
                 if qualified:
                     candidates.append(qualified)
         except requests.HTTPError as e:
@@ -439,7 +640,7 @@ def run_scan(s, now, preview=False):
             LOG.exception('%s failed', sym)
     if success == 0:
         raise RuntimeError('No valid fresh completed stock histories; check credentials, feed and logs')
-    # Critical exit alerts first; do not deduct them from the entry cap.
+    # Exit notices have priority and never count against new-entry limits.
     for k, tracked in list(state['tracked'].items()):
         bars = history.get(tracked['symbol'])
         if bars is None or bars.empty:
@@ -451,36 +652,71 @@ def run_scan(s, now, preview=False):
             if not preview:
                 del state['tracked'][k]
                 save_state(state)
-    # Take top choice in each horizon; cap is per NYSE session, stored persistently.
-    candidates.sort(key=lambda x: (x['horizon'] != 'SHORT', -x['score'], x['symbol']))
+    if market is None:
+        LOG.warning('No entry picks: sentiment benchmarks unavailable')
+        return
+
+    # Restrict news and options requests to the highest quality, fresh candidates.
+    # Rank a small shortlist per horizon, rather than immediately selecting the
+    # first technical match. No obligation to recommend anything on a weak day.
     picks = []
+    news_by_symbol = {}
+    require_option = os.getenv('REQUIRE_OPTION', 'true').strip().lower() != 'false'
+    market_label = market['regime']
+    if market['fear'] is not None:
+        market_label += f" / F&G {market['fear']['score']:.0f}"
+    elif market['oversold_proxy']:
+        market_label += ' / oversold price proxy'
     for horizon in ('SHORT', 'LONGER'):
-        eligible = [x for x in candidates if x['horizon']==horizon
+        eligible = [x for x in candidates if x['horizon'] == horizon
                     and not already_notified(state, x, et.date())]
-        if not eligible:
-            continue
-        chosen = eligible[0]
-        try:
-            chosen['option'] = option_for(s, chosen, now, options_feed)
-        except requests.HTTPError as exc:
-            LOG.warning('%s options data unavailable (HTTP %s); stock idea remains available',
-                        chosen['symbol'], exc.response.status_code if exc.response else '?')
-        except Exception as exc:
-            LOG.warning('%s options unavailable: %s', chosen['symbol'], exc)
-        picks.append(chosen)
+        # Pre-sort: prioritize strong current relative performance; don't reward RSI extremes.
+        eligible.sort(key=lambda x: (-(x['score'] +
+                            x['relative_return'] * (20 if x['side']=='BULLISH' else -20)), x['symbol']))
+        shortlisted = []
+        for idea in eligible[:8]:
+            sym = idea['symbol']
+            if sym not in news_by_symbol:
+                news_by_symbol[sym] = news_catalyst(s, sym, now)
+            catalyst = news_by_symbol[sym]
+            rank = sentiment_rank(idea, market, catalyst)
+            if rank is None:
+                LOG.info('%s %s suppressed: conflicting recent headline', sym, idea['side'])
+                continue
+            enriched = dict(idea, score=rank, catalyst=catalyst, market_label=market_label)
+            shortlisted.append(enriched)
+        shortlisted.sort(key=lambda x: (-x['score'], x['symbol']))
+        for idea in shortlisted[:5]:
+            try:
+                opt = option_for(s, idea, now, options_feed)
+            except requests.HTTPError as exc:
+                LOG.warning('%s options HTTP %s', idea['symbol'],
+                            exc.response.status_code if exc.response is not None else '?')
+                opt = None
+            except Exception as exc:
+                LOG.warning('%s options unavailable: %s', idea['symbol'], exc)
+                opt = None
+            if require_option and not opt:
+                continue
+            idea['option'] = opt
+            picks.append(idea)
+            break
+        if not any(p['horizon']==horizon for p in picks):
+            LOG.info('No qualifying %s candidates with valid sentiment/option filters', horizon)
     if not picks:
-        LOG.info('No new qualifying short/longer swing recommendations today')
-    else:
-        body = (f"📌 SWING TRADE IDEAS — {et:%b %d, %Y %I:%M %p} ET\n"
-                f"{len(picks)} new candidate(s) | Completed daily bars + fresh stock prices\n\n"
-                + '\n\n────────────\n\n'.join(format_entry(x, options_feed) for x in picks))
-        telegram(body, preview=preview)
-        if not preview:
-            for x in picks:
-                mark_entry(state, x, et.date())
-            save_state(state)
-    LOG.info('%d successful data fetches; %d potential setups; %d new recommendations',
-             success, len(candidates), len(picks))
+        LOG.info('No new qualifying sentiment-aware swing + options recommendations today')
+        return
+    digest = (f"📌 SWING + OPTIONS | {et:%b %d %I:%M %p} ET\n"
+              f"Market: {market_label} | SPY {market['benchmarks']['SPY']['ret']:+.1%} / "
+              f"QQQ {market['benchmarks']['QQQ']['ret']:+.1%}\n\n"
+              + '\n\n────────────\n\n'.join(format_entry(x, options_feed) for x in picks)
+              + '\n\nResearch only; not a broker order. Stock stops/targets are NOT option prices. Verify live prices, earnings and preclearance.')
+    telegram(digest, preview=preview)
+    if not preview:
+        for idea in picks:
+            mark_entry(state, idea, et.date())
+        save_state(state)
+    LOG.info('%d data fetches; %d fresh setups; %d new ideas', success, len(candidates), len(picks))
 
 
 def main():
